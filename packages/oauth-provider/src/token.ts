@@ -14,12 +14,18 @@ import type {
 	VerificationValue,
 } from "./types";
 import type { GrantType } from "./types/oauth";
+import { verificationValueSchema } from "./types/zod";
 import { userNormalClaims } from "./userinfo";
 import {
 	basicToClientCredentials,
 	decryptStoredClientSecret,
 	getJwtPlugin,
 	getStoredToken,
+	isPKCERequired,
+	normalizeTimestampValue,
+	parseClientMetadata,
+	resolveSessionAuthTime,
+	resolveSubjectIdentifier,
 	storeToken,
 	validateClientCredentials,
 } from "./utils";
@@ -66,7 +72,7 @@ export async function tokenEndpoint(
 async function createJwtAccessToken(
 	ctx: GenericEndpointContext,
 	opts: OAuthOptions<Scope[]>,
-	user: User,
+	user: User | undefined,
 	client: SchemaClient<Scope[]>,
 	audience: string | string[],
 	scopes: string[],
@@ -85,7 +91,7 @@ async function createJwtAccessToken(
 				scopes,
 				resource: ctx.body.resource,
 				referenceId,
-				metadata: client.metadata ? JSON.parse(client.metadata) : undefined,
+				metadata: parseClientMetadata(client.metadata),
 			})
 		: {};
 
@@ -96,7 +102,7 @@ async function createJwtAccessToken(
 		options: jwtPluginOptions,
 		payload: {
 			...customClaims,
-			sub: user.id,
+			sub: user?.id,
 			aud:
 				typeof audience === "string"
 					? audience
@@ -125,14 +131,14 @@ async function createIdToken(
 	scopes: string[],
 	nonce?: string,
 	sessionId?: string,
+	authTime?: Date,
 ) {
 	const iat = Math.floor(Date.now() / 1000);
 	const exp = iat + (opts.idTokenExpiresIn ?? 36000);
 	const userClaims = userNormalClaims(user, scopes);
-	const authTime = Math.floor(
-		(ctx.context.session?.session.createdAt ?? new Date(iat * 1000)).getTime() /
-			1000,
-	);
+	const resolvedSub = await resolveSubjectIdentifier(user.id, client, opts);
+	const authTimeSec =
+		authTime != null ? Math.floor(authTime.getTime() / 1000) : undefined;
 	// TODO: this should be validated against the login process
 	// - bronze : password only
 	// - silver : mfa
@@ -142,7 +148,7 @@ async function createIdToken(
 		? await opts.customIdTokenClaims({
 				user,
 				scopes,
-				metadata: client.metadata ? JSON.parse(client.metadata) : undefined,
+				metadata: parseClientMetadata(client.metadata),
 			})
 		: {};
 
@@ -151,12 +157,12 @@ async function createIdToken(
 		: getJwtPlugin(ctx.context).options;
 
 	const payload: JWTPayload = {
-		...customClaims,
 		...userClaims,
-		auth_time: authTime,
+		auth_time: authTimeSec,
 		acr,
+		...customClaims,
 		iss: jwtPluginOptions?.jwt?.issuer ?? ctx.context.baseURL,
-		sub: user.id,
+		sub: resolvedSub,
 		aud: client.clientId,
 		nonce,
 		iat,
@@ -270,6 +276,7 @@ async function createRefreshToken(
 	scopes: string[],
 	payload: JWTPayload,
 	originalRefresh?: OAuthRefreshToken<Scope[]> & { id: string },
+	authTime?: Date,
 ) {
 	const iat = payload.iat ?? Math.floor(Date.now() / 1000);
 	const exp = payload?.exp ?? iat + (opts.refreshTokenExpiresIn ?? 2592000);
@@ -302,6 +309,7 @@ async function createRefreshToken(
 			sessionId,
 			userId: user.id,
 			referenceId,
+			authTime,
 			scopes,
 			createdAt: new Date(iat * 1000),
 			expiresAt: new Date(exp * 1000),
@@ -322,7 +330,7 @@ async function checkResource(
 	opts: OAuthOptions<Scope[]>,
 	scopes: string[],
 ) {
-	let resource: string | string[] | undefined = ctx.body.resource;
+	const resource: string | string[] | undefined = ctx.body.resource;
 	const audience =
 		typeof resource === "string"
 			? [resource]
@@ -357,21 +365,42 @@ async function checkResource(
 	return audience?.length === 1 ? audience.at(0) : audience;
 }
 
+interface CreateUserTokensParams {
+	client: SchemaClient<Scope[]>;
+	scopes: string[];
+	grantType: GrantType;
+	user?: User;
+	referenceId?: string;
+	sessionId?: string;
+	nonce?: string;
+	refreshToken?: OAuthRefreshToken<Scope[]> & { id: string };
+	authTime?: Date;
+	verificationValue?: VerificationValue;
+}
+
 async function createUserTokens(
 	ctx: GenericEndpointContext,
 	opts: OAuthOptions<Scope[]>,
-	client: SchemaClient<Scope[]>,
-	scopes: string[],
-	user: User,
-	referenceId?: string,
-	sessionId?: string,
-	nonce?: string,
-	additional?: {
-		refreshToken?: OAuthRefreshToken<Scope[]> & { id: string };
-	},
+	params: CreateUserTokensParams,
 ) {
+	const {
+		client,
+		scopes,
+		user,
+		grantType,
+		referenceId,
+		sessionId,
+		nonce,
+		refreshToken: existingRefreshToken,
+		authTime,
+		verificationValue,
+	} = params;
+
 	const iat = Math.floor(Date.now() / 1000);
-	const defaultExp = iat + (opts.accessTokenExpiresIn ?? 3600);
+	const baseExpiry = user
+		? (opts.accessTokenExpiresIn ?? 3600)
+		: (opts.m2mAccessTokenExpiresIn ?? 3600);
+	const defaultExp = iat + baseExpiry;
 	const exp = opts.scopeExpirations
 		? scopes
 				.map((sc) =>
@@ -387,14 +416,26 @@ async function createUserTokens(
 	// Check requested audience if sent as the resource parameter
 	const audience = await checkResource(ctx, opts, scopes);
 	const isRefreshToken =
-		additional?.refreshToken?.scopes?.includes("offline_access") ||
-		scopes.includes("offline_access");
+		user &&
+		(existingRefreshToken?.scopes?.includes("offline_access") ||
+			scopes.includes("offline_access"));
 	const isJwtAccessToken = audience && !opts.disableJwtPlugin;
-	const isIdToken = scopes.includes("openid");
+	const isIdToken = user && scopes.includes("openid");
+
+	// Resolve custom fields before any token side effects (refresh rotation, DB writes)
+	const customFields = opts.customTokenResponseFields
+		? await opts.customTokenResponseFields({
+				grantType,
+				user,
+				scopes,
+				metadata: parseClientMetadata(client.metadata),
+				verificationValue,
+			})
+		: undefined;
 
 	// Refresh token may need to be created beforehand for id field
 	const earlyRefreshToken =
-		isRefreshToken && !isJwtAccessToken
+		isRefreshToken && user && !isJwtAccessToken
 			? await createRefreshToken(
 					ctx,
 					opts,
@@ -407,7 +448,8 @@ async function createUserTokens(
 						exp: iat + (opts.refreshTokenExpiresIn ?? 2592000),
 						sid: sessionId,
 					},
-					additional?.refreshToken,
+					existingRefreshToken,
+					authTime,
 				)
 			: undefined;
 
@@ -444,7 +486,7 @@ async function createUserTokens(
 				),
 		earlyRefreshToken
 			? earlyRefreshToken
-			: isRefreshToken
+			: isRefreshToken && user
 				? createRefreshToken(
 						ctx,
 						opts,
@@ -457,20 +499,31 @@ async function createUserTokens(
 							exp: iat + (opts.refreshTokenExpiresIn ?? 2592000),
 							sid: sessionId,
 						},
-						additional?.refreshToken,
+						existingRefreshToken,
+						authTime,
 					)
 				: undefined,
-		isIdToken
-			? createIdToken(ctx, opts, user, client, scopes, nonce, sessionId)
+		isIdToken && user
+			? createIdToken(
+					ctx,
+					opts,
+					user,
+					client,
+					scopes,
+					nonce,
+					sessionId,
+					authTime,
+				)
 			: undefined,
 	]);
 
 	return ctx.json(
 		{
+			...customFields,
 			access_token: accessToken,
 			expires_in: exp - iat,
 			expires_at: exp,
-			token_type: "Bearer",
+			token_type: "Bearer" as const,
 			refresh_token: refreshToken?.token,
 			scope: scopes.join(" "),
 			id_token: idToken,
@@ -495,9 +548,6 @@ async function checkVerificationValue(
 	const verification = await ctx.context.internalAdapter.findVerificationValue(
 		await storeToken(opts.storeTokens, code, "authorization_code"),
 	);
-	const verificationValue: VerificationValue = verification
-		? JSON.parse(verification?.value)
-		: undefined;
 
 	if (!verification) {
 		throw new APIError("UNAUTHORIZED", {
@@ -506,12 +556,11 @@ async function checkVerificationValue(
 		});
 	}
 
-	// Delete used code
-	if (verification?.id) {
-		await ctx.context.internalAdapter.deleteVerificationValue(verification.id);
-	}
+	// Delete used code (single-use per RFC 6749 §4.1.2)
+	await ctx.context.internalAdapter.deleteVerificationByIdentifier(
+		await storeToken(opts.storeTokens, code, "authorization_code"),
+	);
 
-	// Check verification
 	if (!verification.expiresAt || verification.expiresAt < new Date()) {
 		throw new APIError("UNAUTHORIZED", {
 			error_description: "code expired",
@@ -519,29 +568,29 @@ async function checkVerificationValue(
 		});
 	}
 
-	// Check verification value
-	if (!verificationValue) {
+	let rawValue: unknown;
+	try {
+		rawValue = JSON.parse(verification.value);
+	} catch {
 		throw new APIError("UNAUTHORIZED", {
-			error_description: "missing verification value content",
+			error_description: "malformed verification value",
 			error: "invalid_verification",
 		});
 	}
-	if (verificationValue.type !== "authorization_code") {
+	const parsed = verificationValueSchema.safeParse(rawValue);
+	if (!parsed.success) {
 		throw new APIError("UNAUTHORIZED", {
-			error_description: "incorrect verification type",
+			error_description: "malformed verification value",
 			error: "invalid_verification",
 		});
 	}
+	// Zod's passthrough adds index signature; the schema already validates the structure
+	const verificationValue = parsed.data as VerificationValue;
+
 	if (verificationValue.query.client_id !== client_id) {
 		throw new APIError("UNAUTHORIZED", {
 			error_description: "invalid client_id",
 			error: "invalid_client",
-		});
-	}
-	if (!verificationValue.userId) {
-		throw new APIError("BAD_REQUEST", {
-			error_description: "missing user_id on challenge",
-			error: "invalid_user",
 		});
 	}
 	if (
@@ -549,7 +598,7 @@ async function checkVerificationValue(
 		verificationValue.query?.redirect_uri !== redirect_uri
 	) {
 		throw new APIError("BAD_REQUEST", {
-			error_description: "missing verification redirect_uri",
+			error_description: "redirect_uri mismatch",
 			error: "invalid_request",
 		});
 	}
@@ -608,10 +657,9 @@ async function handleAuthorizationCodeGrant(
 	const isAuthCodeWithSecret = client_id && client_secret;
 	const isAuthCodeWithPkce = client_id && code && code_verifier;
 
-	if (!(isAuthCodeWithPkce || isAuthCodeWithSecret)) {
+	if (!isAuthCodeWithSecret && !isAuthCodeWithPkce) {
 		throw new APIError("BAD_REQUEST", {
-			error_description:
-				"Missing a required credential value for authorization_code grant",
+			error_description: "Either code_verifier or client_secret is required",
 			error: "invalid_request",
 		});
 	}
@@ -641,31 +689,70 @@ async function handleAuthorizationCodeGrant(
 		scopes,
 	);
 
-	/** Check challenge */
-	const challenge =
-		code_verifier && verificationValue.query?.code_challenge_method === "S256"
-			? await generateCodeChallenge(code_verifier)
-			: undefined;
-	if (
-		// AuthCodeWithSecret - Required if sent
-		isAuthCodeWithSecret &&
-		(challenge || verificationValue?.query?.code_challenge) &&
-		challenge !== verificationValue.query?.code_challenge
-	) {
-		throw new APIError("UNAUTHORIZED", {
-			error_description: "code verification failed",
-			error: "invalid_request",
-		});
+	// Parse scopes from the authorization request
+	const requestedScopes =
+		(verificationValue.query?.scope as string)?.split(" ") || [];
+
+	// Check if PKCE is required for this client
+	const pkceRequired = isPKCERequired(client, requestedScopes);
+
+	// Validate credentials based on requirements
+	if (pkceRequired) {
+		// PKCE is required - must have code_verifier
+		if (!isAuthCodeWithPkce) {
+			throw new APIError("BAD_REQUEST", {
+				error_description: "PKCE is required for this client",
+				error: "invalid_request",
+			});
+		}
+	} else {
+		// PKCE is optional - must have either PKCE or client_secret
+		if (!(isAuthCodeWithPkce || isAuthCodeWithSecret)) {
+			throw new APIError("BAD_REQUEST", {
+				error_description:
+					"Either PKCE (code_verifier) or client authentication (client_secret) is required",
+				error: "invalid_request",
+			});
+		}
 	}
-	if (
-		// AuthCodeWithPkce - Always required
-		isAuthCodeWithPkce &&
-		challenge !== verificationValue.query?.code_challenge
-	) {
-		throw new APIError("UNAUTHORIZED", {
-			error_description: "code verification failed",
-			error: "invalid_request",
-		});
+
+	/** Check PKCE challenge if verifier is provided */
+	const pkceUsedInAuth = !!verificationValue.query?.code_challenge;
+	const pkceUsedInToken = !!code_verifier;
+
+	if (pkceUsedInAuth || pkceUsedInToken) {
+		// PKCE was used - must verify consistency
+
+		if (pkceUsedInAuth && !pkceUsedInToken) {
+			// PKCE was used in authorization but not in token exchange
+			throw new APIError("UNAUTHORIZED", {
+				error_description:
+					"code_verifier required because PKCE was used in authorization",
+				error: "invalid_request",
+			});
+		}
+
+		if (!pkceUsedInAuth && pkceUsedInToken) {
+			// PKCE was not used in authorization but verifier provided
+			throw new APIError("UNAUTHORIZED", {
+				error_description:
+					"code_verifier provided but PKCE was not used in authorization",
+				error: "invalid_request",
+			});
+		}
+
+		// Both sides used PKCE - verify the challenge
+		const challenge =
+			verificationValue.query?.code_challenge_method === "S256"
+				? await generateCodeChallenge(code_verifier!)
+				: undefined;
+
+		if (challenge !== verificationValue.query?.code_challenge) {
+			throw new APIError("UNAUTHORIZED", {
+				error_description: "code verification failed",
+				error: "invalid_request",
+			});
+		}
 	}
 
 	/** Get user */
@@ -702,16 +789,22 @@ async function handleAuthorizationCodeGrant(
 		});
 	}
 
-	return createUserTokens(
-		ctx,
-		opts,
+	const authTime =
+		verificationValue.authTime != null
+			? normalizeTimestampValue(verificationValue.authTime)
+			: resolveSessionAuthTime(session);
+
+	return createUserTokens(ctx, opts, {
 		client,
-		verificationValue.query.scope?.split(" ") ?? [],
+		scopes: verificationValue.query.scope?.split(" ") ?? [],
 		user,
-		verificationValue.referenceId,
-		session.id,
-		verificationValue.query?.nonce,
-	);
+		grantType: "authorization_code",
+		referenceId: verificationValue.referenceId,
+		sessionId: session.id,
+		nonce: verificationValue.query?.nonce,
+		authTime,
+		verificationValue,
+	});
 }
 
 /**
@@ -792,76 +885,11 @@ async function handleClientCredentialsGrant(
 			[];
 	}
 
-	// Check requested audience if sent as the resource parameter
-	const jwtPluginOptions = opts.disableJwtPlugin
-		? undefined
-		: getJwtPlugin(ctx.context).options;
-	const audience = await checkResource(ctx, opts, requestedScopes);
-
-	const iat = Math.floor(Date.now() / 1000);
-	const defaultExp = iat + (opts.m2mAccessTokenExpiresIn ?? 3600);
-	const exp =
-		opts.scopeExpirations && requestedScopes
-			? requestedScopes
-					.map((sc) =>
-						opts.scopeExpirations?.[sc]
-							? toExpJWT(opts.scopeExpirations[sc], iat)
-							: defaultExp,
-					)
-					.reduce((prev, curr) => {
-						return prev < curr ? prev : curr;
-					}, defaultExp)
-			: defaultExp;
-
-	const customClaims = opts.customAccessTokenClaims
-		? await opts.customAccessTokenClaims({
-				scopes: requestedScopes,
-				resource: ctx.body.resource,
-				metadata: client.metadata ? JSON.parse(client.metadata) : undefined,
-			})
-		: {};
-
-	const accessToken =
-		audience && !opts.disableJwtPlugin
-			? await signJWT(ctx, {
-					options: jwtPluginOptions,
-					payload: {
-						...customClaims,
-						aud: audience,
-						azp: client.clientId,
-						scope: requestedScopes.join(" "),
-						iss: jwtPluginOptions?.jwt?.issuer ?? ctx.context.baseURL,
-						iat,
-						exp,
-					},
-				})
-			: await createOpaqueAccessToken(
-					ctx,
-					opts,
-					undefined,
-					client,
-					requestedScopes,
-					{
-						iat,
-						exp,
-					},
-				);
-
-	return ctx.json(
-		{
-			access_token: accessToken,
-			expires_in: exp - iat,
-			expires_at: exp,
-			token_type: "Bearer",
-			scope: requestedScopes.join(" "),
-		},
-		{
-			headers: {
-				"Cache-Control": "no-store",
-				Pragma: "no-cache",
-			},
-		},
-	);
+	return createUserTokens(ctx, opts, {
+		client,
+		scopes: requestedScopes,
+		grantType: "client_credentials",
+	});
 }
 
 /**
@@ -931,7 +959,7 @@ async function handleRefreshTokenGrant(
 	if (!refreshToken) {
 		throw new APIError("BAD_REQUEST", {
 			error_description: "session not found",
-			error: "invalid_request",
+			error: "invalid_grant",
 		});
 	}
 	if (refreshToken.clientId !== client_id) {
@@ -943,7 +971,7 @@ async function handleRefreshTokenGrant(
 	if (refreshToken.expiresAt < new Date()) {
 		throw new APIError("BAD_REQUEST", {
 			error_description: "invalid refresh token",
-			error: "invalid_request",
+			error: "invalid_grant",
 		});
 	}
 	// Replay revoke (delete all tokens for that user-client)
@@ -963,7 +991,7 @@ async function handleRefreshTokenGrant(
 		});
 		throw new APIError("BAD_REQUEST", {
 			error_description: "invalid refresh token",
-			error: "invalid_request",
+			error: "invalid_grant",
 		});
 	}
 
@@ -1000,18 +1028,20 @@ async function handleRefreshTokenGrant(
 		});
 	}
 
+	const authTime =
+		refreshToken.authTime != null
+			? normalizeTimestampValue(refreshToken.authTime)
+			: undefined;
+
 	// Generate new tokens
-	return createUserTokens(
-		ctx,
-		opts,
+	return createUserTokens(ctx, opts, {
 		client,
-		requestedScopes ?? scopes,
+		scopes: requestedScopes ?? scopes,
 		user,
-		refreshToken.referenceId,
-		refreshToken.sessionId,
-		undefined,
-		{
-			refreshToken,
-		},
-	);
+		grantType: "refresh_token",
+		referenceId: refreshToken.referenceId,
+		sessionId: refreshToken.sessionId,
+		refreshToken,
+		authTime,
+	});
 }
